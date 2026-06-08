@@ -1,9 +1,19 @@
 [package]
-name = "common_lock"
+name = "child_lock"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+parking_lot = {version = "0.12", optional = true }
+
+[features]
+default = ["std"]
+std = []
+parking_lot = ["dep:parking_lot"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.clippy]
 # Bevy supplies arguments to systems via dependency injection, so it's natural for systems to
@@ -60,7 +70,6 @@ infallible_try_from = "warn"
 dbg_macro = "warn"
 
 pedantic = { level = "warn", priority = -1 }
-missing_panics_doc = "allow"
 
 # Don't `allow` Your Way Around These Lints - every suppression must be
 # a deliberate #[expect(..., reason = "…")] rather than a silent #[allow]

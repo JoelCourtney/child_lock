@@ -1,178 +1,116 @@
-use std::{
-    borrow::Borrow, cell::UnsafeCell, ptr, sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult}
-};
+//! `child_lock` lets you synchronize multiple "child" [`Mutexes`][::std::sync::Mutex] or
+//! [`RwLocks`][::std::sync::RwLock] to a single "parent" lock. Only the parent lock contains
+//! a real [`Mutex`][::std::sync::Mutex] or [`RwLock`][::std::sync::RwLock]; the children are safe wrappers around
+//! [`UnsafeCell`][::std::cell::UnsafeCell] that can be cheaply unlocked after obtaining a key from the parent.
+//!
+//! ```
+//! # use child_lock::std::*;
+//! let parent = ParentMutex::new();
+//!
+//! let child_a = ChildMutex::new(5, &parent);
+//! let child_b = ChildMutex::new("foo", &parent);
+//!
+//! // Interchangeable keys can be gotten from the parent
+//! // or any of its children.
+//! let key = parent.key().unwrap();
+//!
+//! // Unlocking the child locks is essentially free;
+//! // they don't have real mutexes inside them.
+//! assert_eq!(*child_a.read(&key), 5);
+//! assert_eq!(*child_b.read(&key), "foo");
+//! ```
+//!
+//! For `Mutex`es, only one key can exist for a family at a time. Trying to get another
+//! from a different thread will block that thread, just like a normal mutex. Using
+//! that key, you can access any number of child mutexes immutably simultaneously,
+//! or any one child mutex mutably. (If you could mutate multiple simultaneously,
+//! there would be no compile-time check to stop you from getting two exclusive
+//! references to the same mutex, violating Rust's borrowing rules.)
+//!
+//! For `RwLocks`, you can get many [`SharedKey`s][std::SharedKey] from different threads
+//! at the same time, and use them to unlock any number of child `RwLocks` immutably.
+//! Or you can get one [`ExclusiveKey`][std::ExclusiveKey] with the same semantics as a [`MutexKey`][std::MutexKey] above.
+//!
+//! # Why would I want this?
+//!
+//! You probably don't. In most cases, you can just put all of the relevant data inside
+//! a single `Mutex` or `RwLock`, which makes this crate useless. Even if you can't put
+//! everything in a single lock, this crate might still be a bad idea; you can't write
+//! to more than one child lock at a time. However, if you only need to *read* from
+//! many related locks at the same time, `child_lock` might have some advantages.
+//!
+//! 1. **Performance:** Only the parent lock has an actual lock inside it. If the
+//!    speed of unlocking many related locks is a concern, with `child_lock` you
+//!    only pay the cost of a single lock. Using the key on a child lock only costs
+//!    a pointer comparison to make sure you are using the correct key.
+//! 2. **Easier to reference the contents of a child lock:** Say you want to want to
+//!    return a reference to the contents of a mutex like this:
+//!    ```compile_fail
+//!    # use std::sync::Mutex;
+//!    struct Inner;
+//!    struct Outer(Mutex<Inner>);
+//!    
+//!    impl Outer {
+//!        fn inner(&self) -> &Inner {
+//!            let guard = self.0.lock().unwrap();
+//!            // Error: cannot return value referencing local variable `guard`
+//!            &*guard
+//!        }
+//!    }
+//!    ```
+//!    This fails because the `&Inner` reference can't outlive the mutex guard, which
+//!    is dropped at the end of `fn inner`. In most cases, the solution is to return
+//!    the guard instead. If that isn't practical though, you can use a child mutex:
+//!    ```
+//!    # use child_lock::std::{ArcChildMutex, MutexKey};
+//!    struct Inner;
+//!    struct Outer(ArcChildMutex<Inner>);
+//!    
+//!    impl Outer {
+//!       fn inner<'a>(&'a self, key: &'a MutexKey) -> &'a Inner {
+//!          self.0.read(key)
+//!       }
+//!    }
+//!    ```
+//!
+//! # `ArcChild` and `RefChild`
+//!
+//! The child locks need to reference the parent lock, and this can be done with any
+//! type that implements `Borrow<ParentMutex>` (or `Borrow<ParentRwLock>` for [`ChildRwLocks`][std::ChildRwLock]).
+//! For example, you can use `Arc<ParentMutex>` and then forget about the parent:
+//!
+//! ```
+//! # use child_lock::std::{ParentMutex, ChildMutex};
+//! # use std::sync::Arc;
+//! let parent = Arc::new(ParentMutex::new());
+//! let child = ChildMutex::new(5, parent.clone());
+//!
+//! drop(parent);
+//!
+//! *child.write(&mut child.key().unwrap()) = 10;
+//! ```
+//!
+//! To make it easier to declare child lock types, use [`RefChildMutex`][std::`RefChildMutex`], [`ArcChildMutex`][std::ArcChildMutex], and the
+//! equivalent types for `RwLocks`.
+//!
+//! # Feature flags
+//!
+//! ## `std` (default)
+//!
+//! Implements lock families for the stdlib's [`Mutex`][::std::sync::Mutex] and [`RwLock`][::std::sync::RwLock].
+//!
+//! **Disabling this feature does not make this crate `no_std` compatible!** The only other way to use this
+//! library is with `parking_lot`, which also requires the standard library.
+//!
+//! ## `parking_lot`
+//!
+//! Equivalent lock families are available for `parking_lot`'s [`Mutex`][::parking_lot::Mutex] and [`RwLock`][::parking_lot::RwLock], though not
+//! all of the `parking_lot`'s functionality is implemented.
 
-#[derive(Default)]
-pub struct ParentMutex(Mutex<()>);
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
-impl ParentMutex {
-    #[must_use]
-    pub const fn new() -> Self {
-        ParentMutex(Mutex::new(()))
-    }
+#[cfg(feature = "std")]
+pub mod std;
 
-    pub fn key(&self) -> LockResult<MutexKey<'_>> {
-        let address = ptr::from_ref(self);
-        match self.0.lock() {
-            Ok(guard) => Ok(MutexKey { guard, address }),
-            Err(err) => Err(PoisonError::new(MutexKey {
-                guard: err.into_inner(),
-                address,
-            })),
-        }
-    }
-
-    pub fn try_key(&self) -> TryLockResult<MutexKey<'_>> {
-        let address = ptr::from_ref(self);
-        match self.0.try_lock() {
-            Ok(guard) => Ok(MutexKey { guard, address }),
-            Err(TryLockError::Poisoned(err)) => {
-                Err(TryLockError::Poisoned(PoisonError::new(MutexKey {
-                    guard: err.into_inner(),
-                    address,
-                })))
-            }
-            Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
-        }
-   }
-}
-
-pub struct ChildMutex<T: ?Sized, M: Borrow<ParentMutex>> {
-    lock: M,
-    data: UnsafeCell<T>,
-}
-
-pub type RefChildMutex<'m, T> = ChildMutex<T, &'m ParentMutex>;
-pub type ArcChildMutex<T> = ChildMutex<T, Arc<ParentMutex>>;
-
-impl<T, M: Borrow<ParentMutex>> ChildMutex<T, M> {
-    pub fn new(data: T, lock: M) -> Self {
-        ChildMutex {
-            lock,
-            data: UnsafeCell::new(data),
-        }
-    }
-
-    pub fn into_inner(self) -> T {
-        self.data.into_inner()
-    }
-}
-
-impl<T: ?Sized, M: Borrow<ParentMutex>> ChildMutex<T, M> {
-    pub fn key(&self) -> LockResult<MutexKey<'_>> {
-        self.lock.borrow().key()
-    }
-
-    pub fn try_key(&self) -> TryLockResult<MutexKey<'_>> {
-        self.lock.borrow().try_key()
-    }
-
-    pub fn read<'a>(&'a self, key: &'a MutexKey<'_>) -> &'a T {
-        let lock = self.lock.borrow();
-        assert_eq!(
-            key.address, ptr::from_ref(lock),
-            "Attempted to read a child mutex with a key that came from an unrelated parent mutex."
-        );
-        unsafe { &*self.data.get() }
-    }
-
-    pub fn write<'a>(&'a self, key: &'a mut MutexKey<'_>) -> &'a mut T {
-        let lock = self.lock.borrow();
-        assert_eq!(
-            key.address, ptr::from_ref(lock),
-            "Attempted to write to a child mutex with a key that came from an unrelated parent mutex."
-        );
-        unsafe { &mut *self.data.get() }
-    }
-
-    pub fn get_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.data.get() }
-    }
-    
-    pub fn central_mutex_mut(&mut self) -> &mut M {
-        &mut self.lock
-    }
-}
-
-impl<T, M: Clone + Borrow<ParentMutex>> ChildMutex<T, M> {
-    pub fn new_sibling<U>(&self, data: U) -> ChildMutex<U, M> {
-        ChildMutex::new(data, self.lock.clone())
-    }
-}
-
-#[expect(
-    dead_code,
-    reason = "The read guard is never used but it must be kept alive"
-)]
-pub struct MutexKey<'a> {
-    guard: MutexGuard<'a, ()>,
-    address: *const ParentMutex,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn owned_common_mutex() {
-        let mutex = ChildMutex::new(5, ParentMutex::new());
-        
-        let mut key = mutex.key().unwrap();
-        assert_eq!(*mutex.write(&mut key), 5)
-    }
-
-    #[test]
-    fn read_ref_common_mutex() {
-        let central = ParentMutex::new();
-        let mutex = ChildMutex::new(5, &central);
-
-        let key = central.key().unwrap();
-        assert_eq!(*mutex.read(&key), 5);
-    }
-
-    #[test]
-    fn read_arc_common_mutex() {
-        let central = Arc::new(ParentMutex::new());
-        let mutex = ChildMutex::new(5, central.clone());
-
-        drop(central);
-
-        let key = mutex.key().unwrap();
-        assert_eq!(*mutex.read(&key), 5);
-    }
-
-    #[test]
-    fn new_sibling_ref() {
-        let central = ParentMutex::new();
-        let mutex = ChildMutex::new(5, &central);
-        let sibling = mutex.new_sibling(10);
-
-        let key = central.key().unwrap();
-
-        assert_eq!(*mutex.read(&key), 5);
-        assert_eq!(*sibling.read(&key), 10);
-    }
-
-    #[test]
-    fn new_sibling_arc() {
-        let central = Arc::new(ParentMutex::new());
-        let mutex = ChildMutex::new(5, central.clone());
-        drop(central);
-        
-        let sibling = mutex.new_sibling(10);
-
-        let key = mutex.key().unwrap();
-
-        assert_eq!(*mutex.read(&key), 5);
-        assert_eq!(*sibling.read(&key), 10);
-    }
-
-    #[test]
-    fn write() {
-        let central = ParentMutex::new();
-        let mutex = ChildMutex::new(5, &central);
-        let mut key = central.key().unwrap();
-        *mutex.write(&mut key) = 10;
-        assert_eq!(*mutex.read(&key), 10);
-    }
-}
+#[cfg(feature = "parking_lot")]
+pub mod parking_lot;
