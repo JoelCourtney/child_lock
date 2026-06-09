@@ -57,7 +57,7 @@
 //!    # use std::sync::Mutex;
 //!    struct Inner;
 //!    struct Outer(Mutex<Inner>);
-//!    
+//!
 //!    impl Outer {
 //!        fn inner(&self) -> &Inner {
 //!            let guard = self.0.lock().unwrap();
@@ -75,7 +75,7 @@
 //!    # use std::sync::Arc;
 //!    struct Inner;
 //!    struct Outer(ChildLock<Inner, Arc<MutexParent>>);
-//!    
+//!
 //!    impl Outer {
 //!       fn inner<'a>(&'a self, key: &'a impl Key) -> &'a Inner {
 //!          self.0.read(key)
@@ -349,6 +349,13 @@ impl<T, M: Clone + Borrow<dyn ParentLock>> ChildLock<T, M> {
     pub fn new_sibling<U>(&self, data: U) -> ChildLock<U, M> {
         ChildLock::new(data, self.parent.clone())
     }
+}
+
+// SAFETY: Only one mutable reference to the contents can exist at a time, so
+// ChildLock is sync if T is sync.
+unsafe impl<T: ?Sized + Send + Sync, M: Borrow<dyn ParentLock> + Send + Sync> Sync
+    for ChildLock<T, M>
+{
 }
 
 /// A trait for keys that can be used to immutably unlock child locks.
