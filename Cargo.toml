@@ -1,7 +1,12 @@
 [package]
 name = "child_lock"
+description = "Synchronize access to many locks using only a single parent lock"
 version = "0.1.0"
 edition = "2024"
+keywords = ["mutex", "rwlock", "thread"]
+categories = ["concurrency"]
+repository = "https://github.com/JoelCourtney/child_lock"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 parking_lot = {version = "0.12", optional = true }
