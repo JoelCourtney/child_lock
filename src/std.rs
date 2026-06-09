@@ -44,8 +44,11 @@ impl Borrow<dyn ParentLock> for Arc<MutexParent> {
 
 impl MutexParent {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            mutex: Mutex::new(()),
+            marker: ParentMarker
+        }
     }
 
     /// Gets an exclusive key for this lock family, potentially blocking
@@ -171,8 +174,11 @@ impl Borrow<dyn ParentLock> for Arc<RwParent> {
 
 impl RwParent {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            lock: RwLock::new(()),
+            marker: ParentMarker
+        }
     }
 
     /// Gets a shared key for this lock family, potentially blocking
