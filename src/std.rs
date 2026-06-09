@@ -47,7 +47,7 @@ impl MutexParent {
     pub const fn new() -> Self {
         Self {
             mutex: Mutex::new(()),
-            marker: ParentMarker
+            marker: ParentMarker,
         }
     }
 
@@ -177,7 +177,7 @@ impl RwParent {
     pub const fn new() -> Self {
         Self {
             lock: RwLock::new(()),
-            marker: ParentMarker
+            marker: ParentMarker,
         }
     }
 
