@@ -1,344 +1,344 @@
 use std::{
     borrow::Borrow,
-    cell::UnsafeCell,
-    ptr,
-    sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult},
+    sync::{
+        Arc, LockResult, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        TryLockError, TryLockResult,
+    },
 };
 
-/// A parent mutex that holds no data and can be used to cheaply unlock
-/// its child mutexes.
-#[derive(Default)]
-pub struct ParentMutex(Mutex<()>);
+use crate::{ExclusiveKey, Key, ParentLock, ParentMarker};
 
-impl ParentMutex {
-    /// Create a new parent mutex.
+/// A parent lock that uses a [`Mutex`] to synchronize access to child locks.
+///
+/// Much like a [`Mutex`], this lock can become poisoned if a thread panics while
+/// holding the key. See [`Mutex`] for more information.
+#[derive(Default)]
+pub struct MutexParent {
+    mutex: Mutex<()>,
+    marker: ParentMarker,
+}
+
+impl ParentLock for MutexParent {
+    fn marker(&self) -> &ParentMarker {
+        &self.marker
+    }
+}
+
+impl Borrow<dyn ParentLock> for MutexParent {
+    fn borrow(&self) -> &(dyn ParentLock + 'static) {
+        self
+    }
+}
+
+impl Borrow<dyn ParentLock> for &'_ MutexParent {
+    fn borrow(&self) -> &(dyn ParentLock + 'static) {
+        *self
+    }
+}
+
+impl Borrow<dyn ParentLock> for Arc<MutexParent> {
+    fn borrow(&self) -> &(dyn ParentLock + 'static) {
+        &**self
+    }
+}
+
+impl MutexParent {
     #[must_use]
-    pub const fn new() -> Self {
-        ParentMutex(Mutex::new(()))
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Lock the parent mutex and get a key that can be used to unlock
-    /// child mutexes. Blocks the current thread until the key becomes
-    /// available.
+    /// Gets an exclusive key for this lock family, potentially blocking
+    /// until it can be acquired.
     ///
     /// # Errors
     ///
-    /// Returns an error if the parent mutex is poisoned. This happens
-    /// if a thread panics while holding the key, potentially violating
-    /// mutex invariants. The error still contains a [`MutexKey`], which
-    /// you can use to fix those invariants and clear the poison if you
-    /// want. See [`Mutex`] for more details.
+    /// Returns an error if the lock is poisoned. This happens when a thread
+    /// panics while holding the key, which may leave the child lock contents
+    /// in a state that doesn't uphold the lock's invariants. See [`Mutex`]
+    /// for more information.
     pub fn key(&self) -> LockResult<MutexKey<'_>> {
-        let address = ptr::from_ref(self);
-        match self.0.lock() {
-            Ok(guard) => Ok(MutexKey { guard, address }),
-            Err(err) => Err(PoisonError::new(MutexKey {
-                guard: err.into_inner(),
-                address,
+        match self.mutex.lock() {
+            Ok(guard) => Ok(MutexKey {
+                guard,
+                address: &self.marker,
+            }),
+            Err(e) => Err(PoisonError::new(MutexKey {
+                guard: e.into_inner(),
+                address: &self.marker,
             })),
         }
     }
 
-    /// Attempts to lock the parent mutex and get the key without blocking.
+    /// Tries to get an exclusive key for this lock family, without blocking.
     ///
     /// # Errors
     ///
-    /// Returns an error if the parent mutex is poisoned (see [key][ParentMutex::key]), or if
-    /// the key is already held by another thread.
+    /// Returns an error if the lock is poisoned. See [`key`][MutexParent::key].
+    /// Also returns an error if the lock is currently locked by another thread.
     pub fn try_key(&self) -> TryLockResult<MutexKey<'_>> {
-        let address = ptr::from_ref(self);
-        match self.0.try_lock() {
-            Ok(guard) => Ok(MutexKey { guard, address }),
-            Err(TryLockError::Poisoned(err)) => {
+        match self.mutex.try_lock() {
+            Ok(guard) => Ok(MutexKey {
+                guard,
+                address: &self.marker,
+            }),
+            Err(TryLockError::Poisoned(e)) => {
                 Err(TryLockError::Poisoned(PoisonError::new(MutexKey {
-                    guard: err.into_inner(),
-                    address,
+                    guard: e.into_inner(),
+                    address: &self.marker,
                 })))
             }
             Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
         }
     }
 
-    /// Checks if the parent mutex is poisoned.
-    ///
-    /// See [`Mutex`] for details about poisoning.
+    /// Determines if the lock is poisoned.
     pub fn is_poisoned(&self) -> bool {
-        self.0.is_poisoned()
+        self.mutex.is_poisoned()
     }
 
-    /// Clears the poison flag on the parent mutex.
-    ///
-    /// See [`Mutex`] for details about poisoning.
+    /// Clears the poison flag on the lock, if it is poisoned.
     pub fn clear_poison(&self) {
-        self.0.clear_poison();
+        self.mutex.clear_poison();
     }
 }
 
-/// A child mutex that can be cheaply unlocked with a key from the parent.
-///
-/// The child mutexes refer to the parent with a generic parameter
-/// `M: Borrow<ParentMutex>`, to accomodate both references and [`Arcs`][Arc].
-/// This can make delaring child mutex types annoying; use [`RefChildMutex`]
-/// and [`ArcChildMutex`] for type declarations.
-///
-/// # Example
-///
-/// ```
-/// # use child_lock::std::*;
-/// let parent = ParentMutex::new();
-///
-/// let child_a = ChildMutex::new(5, &parent);
-/// let child_b = ChildMutex::new("foo", &parent);
-///
-/// // Interchangeable keys can be gotten from the parent
-/// // or any of its children.
-/// let key = parent.key().unwrap();
-///
-/// // Unlocking the child locks is essentially free;
-/// // they don't have real mutexes inside them.
-/// assert_eq!(*child_a.read(&key), 5);
-/// assert_eq!(*child_b.read(&key), "foo");
-/// ```
-pub struct ChildMutex<T: ?Sized, M: Borrow<ParentMutex>> {
-    parent: M,
-    data: UnsafeCell<T>,
-}
-
-/// A child mutex with a plain reference to the parent.
-pub type RefChildMutex<'p, T> = ChildMutex<T, &'p ParentMutex>;
-
-/// A child mutex that references its parent through an [`Arc`],
-/// with no lifetime requirements.
-pub type ArcChildMutex<T> = ChildMutex<T, Arc<ParentMutex>>;
-
-impl<T, M: Borrow<ParentMutex>> ChildMutex<T, M> {
-    /// Create a new child mutex.
-    pub const fn new(data: T, lock: M) -> Self {
-        ChildMutex {
-            parent: lock,
-            data: UnsafeCell::new(data),
-        }
-    }
-
-    /// Consumes `self` to produce the inner value. No key is
-    /// required because you can't call this function if `self` is
-    /// still shared.
-    pub fn into_inner(self) -> T {
-        self.data.into_inner()
-    }
-}
-
-impl<T: ?Sized, M: Borrow<ParentMutex>> ChildMutex<T, M> {
-    /// Get a reference to the parent mutex.
-    pub fn parent(&self) -> &M {
-        &self.parent
-    }
-
-    /// Gets the key, blocking the current thread until it is
-    /// available. Equivalent to calling [`key`][ParentMutex::key] on
-    /// the parent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the parent is poisoned. See [`key`][ParentMutex::key].
-    pub fn key(&self) -> LockResult<MutexKey<'_>> {
-        self.parent.borrow().key()
-    }
-
-    /// Tries to get the key, but returns an error without blocking if it is
-    /// unavailable. Equivalent to calling [`try_key`][ParentMutex::try_key] on
-    /// the parent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the parent is poisoned. See [`try_key`][ParentMutex::try_key].
-    pub fn try_key(&self) -> TryLockResult<MutexKey<'_>> {
-        self.parent.borrow().try_key()
-    }
-
-    /// Get a shared reference to the contents of this child mutex with a key.
-    ///
-    /// This keeps both `self` and `key` borrowed for as long as the returned
-    /// reference lives.
-    ///
-    /// # Panics
-    ///
-    /// This method will panic if the key was gotten from a parent other than
-    /// this child's parent. For example:
-    ///
-    /// ```should_panic
-    /// # use child_lock::std::{ParentMutex, ChildMutex};
-    /// let parent1 = ParentMutex::new();
-    /// let parent2 = ParentMutex::new();
-    ///
-    /// let child = ChildMutex::new(5, &parent1);
-    ///
-    /// // Getting key from the wrong parent!
-    /// let key = parent2.key().unwrap();
-    ///
-    /// child.read(&key);
-    /// ```
-    pub fn read<'a>(&'a self, key: &'a MutexKey<'_>) -> &'a T {
-        match self.try_read(key) {
-            Ok(r) => r,
-            Err(MismatchingMutexKeyError {
-                key_parent,
-                child_parent,
-            }) => {
-                panic!(
-                    "Attempting to read a child mutex with parent at address {child_parent:?}, but with a key at address {key_parent:?}"
-                );
-            }
-        }
-    }
-
-    /// Get a shared reference to the contents of this child mutex with a key.
-    ///
-    /// This keeps both `self` and `key` borrowed for as long as the returned
-    /// reference lives.
-    ///
-    /// # Errors
-    ///
-    /// This method will return an error if the key was gotten from a parent other than
-    /// this child's parent. For example:
-    ///
-    /// ```
-    /// # use child_lock::std::{ParentMutex, ChildMutex};
-    /// let parent1 = ParentMutex::new();
-    /// let parent2 = ParentMutex::new();
-    ///
-    /// let child = ChildMutex::new(5, &parent1);
-    ///
-    /// // Getting key from the wrong parent!
-    /// let key = parent2.key().unwrap();
-    ///
-    /// assert!(child.try_read(&key).is_err());
-    /// ```
-    pub fn try_read<'a>(
-        &'a self,
-        key: &'a MutexKey<'_>,
-    ) -> Result<&'a T, MismatchingMutexKeyError> {
-        let lock = self.parent.borrow();
-        if key.address != ptr::from_ref(lock) {
-            return Err(MismatchingMutexKeyError {
-                key_parent: key.address,
-                child_parent: lock,
-            });
-        }
-        Ok(unsafe { &*self.data.get() })
-    }
-
-    /// Get an exclusive reference to the contents of this child mutex with
-    /// an exclusive reference to a key.
-    ///
-    /// This keeps both `self` and `key` borrowed for as long as the returned
-    /// reference lives.
-    ///
-    /// # Panics
-    ///
-    /// This method will panic if the key was gotten from a parent other than
-    /// this child's parent. See [`read`][ChildMutex::read].
-    pub fn write<'a>(&'a self, key: &'a mut MutexKey<'_>) -> &'a mut T {
-        match self.try_write(key) {
-            Ok(r) => r,
-            Err(MismatchingMutexKeyError {
-                key_parent,
-                child_parent,
-            }) => {
-                panic!(
-                    "Attempting to write a child mutex with parent at address {child_parent:?}, but with a key at address {key_parent:?}"
-                );
-            }
-        }
-    }
-
-    /// Get an exclusive reference to the contents of this child mutex with
-    /// an exclusive reference to a key.
-    ///
-    /// This keeps both `self` and `key` borrowed for as long as the returned
-    /// reference lives.
-    ///
-    /// # Errors
-    ///
-    /// This method will return an error if the key was gotten from a parent other than
-    /// this child's parent. See [`try_read`][ChildMutex::try_read].
-    pub fn try_write<'a>(
-        &'a self,
-        key: &'a mut MutexKey<'_>,
-    ) -> Result<&'a mut T, MismatchingMutexKeyError> {
-        let lock = self.parent.borrow();
-        if key.address != ptr::from_ref(lock) {
-            return Err(MismatchingMutexKeyError {
-                key_parent: key.address,
-                child_parent: lock,
-            });
-        }
-        Ok(unsafe { &mut *self.data.get() })
-    }
-
-    /// Gets a reference to the contents without a key. This is safe because
-    /// it requires an exclusive reference to `self`.
-    pub fn get_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.data.get() }
-    }
-}
-
-impl<T, M: Clone + Borrow<ParentMutex>> ChildMutex<T, M> {
-    /// Create a new child mutex from the same parent as this child.
-    ///
-    /// This is especially useful with [`ArcChildMutex`], where the original
-    /// parent handle might have been dropped.
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use child_lock::std::*;
-    /// let child1 = ChildMutex::new(5, Arc::new(ParentMutex::new()));
-    /// let child2 = child1.new_sibling("foo");
-    ///
-    /// let key = child1.key().unwrap();
-    /// assert_eq!(*child2.read(&key), "foo");
-    /// ```
-    pub fn new_sibling<U>(&self, data: U) -> ChildMutex<U, M> {
-        ChildMutex::new(data, self.parent.clone())
-    }
-}
-
-/// A key that can unlock all the [`ChildMutexes`][ChildMutex] in a family.
-///
-/// Can be obtained from either the parent of any of the children.
+/// The key type generated by [`Mutexes`][Mutex].
 #[expect(
     dead_code,
     reason = "The read guard is never used but it must be kept alive"
 )]
 pub struct MutexKey<'a> {
     guard: MutexGuard<'a, ()>,
-    address: *const ParentMutex,
+    address: &'a ParentMarker,
 }
 
-/// An error indicating that a child was unlocked with a key that came from the
-/// wrong parent.
-#[derive(Debug)]
-pub struct MismatchingMutexKeyError {
-    key_parent: *const ParentMutex,
-    child_parent: *const ParentMutex,
+// SAFETY: MutexKey contains a MutexGuard, which guaranatees that
+// only one MutexKey can exist for a given MutexParent at a time.
+unsafe impl Key for MutexKey<'_> {
+    fn parent_marker(&self) -> &ParentMarker {
+        self.address
+    }
 }
+
+// SAFETY: MutexKey contains a MutexGuard, which guaranatees that
+// only one MutexKey can exist for a given MutexParent at a time.
+unsafe impl ExclusiveKey for MutexKey<'_> {}
+
+/// A parent lock that uses [`RwLock`] to provide read/write access to child locks.
+///
+/// # You probably only need a [`MutexParent`].
+///
+/// The utility of a [`RwParent`] is much more niche than a normal [`RwLock`]. A
+/// [`RwLock`] allows multiple simultaneous reader threads or only one writer thread;
+/// a [`RwParent`] allows multiple simultaneous reader *keys*, or only one writer
+/// *key*. For comparison, a [`MutexParent`] only allows one [`MutexKey`] at a time,
+/// but that single key can be shared across threads. It can be used to read any
+/// number of [`ChildLocks`][super::ChildLock] simultaneously, and those children can be read
+/// by any number of threads that share the key simultaneously.
+///
+/// You should only need to use a [`RwParent`] if it is for some reason impractical
+/// to share the reader keys between all threads that need them.
+#[derive(Default)]
+pub struct RwParent {
+    lock: RwLock<()>,
+    marker: ParentMarker,
+}
+
+impl ParentLock for RwParent {
+    fn marker(&self) -> &ParentMarker {
+        &self.marker
+    }
+}
+
+impl Borrow<dyn ParentLock> for RwParent {
+    fn borrow(&self) -> &(dyn ParentLock + 'static) {
+        self
+    }
+}
+
+impl Borrow<dyn ParentLock> for &'_ RwParent {
+    fn borrow(&self) -> &(dyn ParentLock + 'static) {
+        *self
+    }
+}
+
+impl Borrow<dyn ParentLock> for Arc<RwParent> {
+    fn borrow(&self) -> &(dyn ParentLock + 'static) {
+        &**self
+    }
+}
+
+impl RwParent {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Gets a shared key for this lock family, potentially blocking
+    /// until it can be acquired. Will not block if another shared key
+    /// already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned. This happens when a thread
+    /// panics while holding the key, which may leave the child lock contents
+    /// in a state that doesn't uphold the lock's invariants. See [`RwLock`]
+    /// for more information.
+    pub fn shared_key(&self) -> LockResult<RwLockReadKey<'_>> {
+        match self.lock.read() {
+            Ok(guard) => Ok(RwLockReadKey {
+                guard,
+                address: &self.marker,
+            }),
+            Err(e) => Err(PoisonError::new(RwLockReadKey {
+                guard: e.into_inner(),
+                address: &self.marker,
+            })),
+        }
+    }
+
+    /// Tries to get a shared key for this lock family, without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned. See [`shared_key`][RwParent::shared_key].
+    /// Also returns an error if an exclusive key is currently held by another thread.
+    pub fn try_shared_key(&self) -> TryLockResult<RwLockReadKey<'_>> {
+        match self.lock.try_read() {
+            Ok(guard) => Ok(RwLockReadKey {
+                guard,
+                address: &self.marker,
+            }),
+            Err(TryLockError::Poisoned(e)) => {
+                Err(TryLockError::Poisoned(PoisonError::new(RwLockReadKey {
+                    guard: e.into_inner(),
+                    address: &self.marker,
+                })))
+            }
+            Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
+        }
+    }
+
+    /// Gets an exclusive key for this lock family, potentially blocking
+    /// until it can be acquired.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned. This happens when a thread
+    /// panics while holding the key, which may leave the child lock contents
+    /// in a state that doesn't uphold the lock's invariants. See [`RwLock`]
+    /// for more information.
+    pub fn exclusive_key(&self) -> LockResult<RwLockWriteKey<'_>> {
+        match self.lock.write() {
+            Ok(guard) => Ok(RwLockWriteKey {
+                guard,
+                address: &self.marker,
+            }),
+            Err(e) => Err(PoisonError::new(RwLockWriteKey {
+                guard: e.into_inner(),
+                address: &self.marker,
+            })),
+        }
+    }
+
+    /// Tries to get an exclusive key for this lock family, without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned. See [`exclusive_key`][RwParent::exclusive_key].
+    /// Also returns an error if any key is currently held by another thread.
+    pub fn try_exclusive_key(&self) -> TryLockResult<RwLockWriteKey<'_>> {
+        match self.lock.try_write() {
+            Ok(guard) => Ok(RwLockWriteKey {
+                guard,
+                address: &self.marker,
+            }),
+            Err(TryLockError::Poisoned(e)) => {
+                Err(TryLockError::Poisoned(PoisonError::new(RwLockWriteKey {
+                    guard: e.into_inner(),
+                    address: &self.marker,
+                })))
+            }
+            Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
+        }
+    }
+
+    /// Determines if the lock is poisoned.
+    pub fn is_poisoned(&self) -> bool {
+        self.lock.is_poisoned()
+    }
+
+    /// Clears the poison flag on the lock, if it is poisoned.
+    pub fn clear_poison(&self) {
+        self.lock.clear_poison();
+    }
+}
+
+/// A key type generated by [`RwLocks`][RwLock] that can only be used to read children.
+///
+/// Many of these keys can exist simultaneously, and each of them can be used to read
+/// multiple children at once. A read key can't coexist with a write key.
+#[expect(
+    dead_code,
+    reason = "The read guard is never used but it must be kept alive"
+)]
+pub struct RwLockReadKey<'a> {
+    guard: RwLockReadGuard<'a, ()>,
+    address: &'a ParentMarker,
+}
+
+// SAFETY: RwLockReadKey contains an RwLockReadGuard, which guarantees that this can't
+// coexist with a write key.
+unsafe impl Key for RwLockReadKey<'_> {
+    fn parent_marker(&self) -> &ParentMarker {
+        self.address
+    }
+}
+
+/// A key type generated by [`RwLocks`][RwLock] that can be used to read and write children.
+///
+/// A write key can't coexist with a read key or other write keys, but can be used to read
+/// multiple children at once.
+#[expect(
+    dead_code,
+    reason = "The write guard is never used but it must be kept alive"
+)]
+pub struct RwLockWriteKey<'a> {
+    guard: RwLockWriteGuard<'a, ()>,
+    address: &'a ParentMarker,
+}
+
+// SAFETY: RwLockWriteKey contains an RwLockWriteGuard, which guarantees that this can't
+// coexist with any other keys for this parent.
+unsafe impl Key for RwLockWriteKey<'_> {
+    fn parent_marker(&self) -> &ParentMarker {
+        self.address
+    }
+}
+
+// SAFETY: RwLockWriteKey contains an RwLockWriteGuard, which guarantees that this can't
+// coexist with any other keys for this parent.
+unsafe impl ExclusiveKey for RwLockWriteKey<'_> {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChildLock;
 
     #[test]
     fn owned_child_mutex() {
-        let mutex = ChildMutex::new(5, ParentMutex::new());
+        let parent = MutexParent::new();
+        let mutex = ChildLock::new(5, &parent);
 
-        let mut key = mutex.key().unwrap();
+        let mut key = parent.key().unwrap();
         assert_eq!(*mutex.write(&mut key), 5)
     }
 
     #[test]
     fn read_ref_child_mutex() {
-        let parent = ParentMutex::new();
-        let mutex = ChildMutex::new(5, &parent);
+        let parent = MutexParent::new();
+        let mutex = ChildLock::new(5, &parent);
 
         let key = parent.key().unwrap();
         assert_eq!(*mutex.read(&key), 5);
@@ -346,19 +346,17 @@ mod tests {
 
     #[test]
     fn read_arc_child_mutex() {
-        let parent = Arc::new(ParentMutex::new());
-        let mutex = ChildMutex::new(5, parent.clone());
+        let parent = Arc::new(MutexParent::new());
+        let mutex = ChildLock::new(5, parent.clone());
 
-        drop(parent);
-
-        let key = mutex.key().unwrap();
+        let key = parent.key().unwrap();
         assert_eq!(*mutex.read(&key), 5);
     }
 
     #[test]
     fn new_sibling_ref() {
-        let parent = ParentMutex::new();
-        let mutex = ChildMutex::new(5, &parent);
+        let parent = MutexParent::new();
+        let mutex = ChildLock::new(5, &parent);
         let sibling = mutex.new_sibling(10);
 
         let key = parent.key().unwrap();
@@ -369,13 +367,14 @@ mod tests {
 
     #[test]
     fn new_sibling_arc() {
-        let parent = Arc::new(ParentMutex::new());
-        let mutex = ChildMutex::new(5, parent.clone());
+        let parent = Arc::new(MutexParent::new());
+        let mutex = ChildLock::new(5, parent.clone());
+
         drop(parent);
 
         let sibling = mutex.new_sibling(10);
 
-        let key = mutex.key().unwrap();
+        let key = mutex.parent.key().unwrap();
 
         assert_eq!(*mutex.read(&key), 5);
         assert_eq!(*sibling.read(&key), 10);
@@ -383,8 +382,8 @@ mod tests {
 
     #[test]
     fn write() {
-        let parent = ParentMutex::new();
-        let mutex = ChildMutex::new(5, &parent);
+        let parent = MutexParent::new();
+        let mutex = ChildLock::new(5, &parent);
         let mut key = parent.key().unwrap();
         *mutex.write(&mut key) = 10;
         assert_eq!(*mutex.read(&key), 10);
@@ -393,19 +392,31 @@ mod tests {
     #[test]
     #[should_panic]
     fn wrong_key_panic() {
-        let parent = ParentMutex::new();
-        let impostor = ParentMutex::new();
-        let mutex = ChildMutex::new(5, &parent);
+        let parent = MutexParent::new();
+        let impostor = MutexParent::new();
+        let mutex = ChildLock::new(5, &parent);
         let key = impostor.key().unwrap();
         assert_eq!(*mutex.read(&key), 5);
     }
 
     #[test]
     fn try_wrong_key_err() {
-        let parent = ParentMutex::new();
-        let impostor = ParentMutex::new();
-        let mutex = ChildMutex::new(5, &parent);
+        let parent = MutexParent::new();
+        let impostor = MutexParent::new();
+        let mutex = ChildLock::new(5, &parent);
         let key = impostor.key().unwrap();
         assert!(mutex.try_read(&key).is_err());
+    }
+
+    #[test]
+    fn rw_parent() {
+        let parent = RwParent::new();
+        let child = ChildLock::new(5, &parent);
+
+        let key1 = parent.shared_key().unwrap();
+        let key2 = child.parent.shared_key().unwrap();
+
+        assert_eq!(*child.read(&key1), 5);
+        assert_eq!(*child.read(&key2), 5);
     }
 }
